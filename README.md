@@ -1,149 +1,125 @@
-"type": "TICKET_ERROR",
-  "error_code": "TICK-RT-08",
-  "reported_at": "2025-09-17T14:00:00+07:00",
-  "booking": {
-    "roundtrip": true,
-    "passengers": 8,
-    "origin_city": "Ho Chi Minh City",
-    "origin_iata": "SGN",
-    "destination_city": "Ha Noi",
-    "destination_iata": "HAN",
-    "outbound": {
-      "flight_no": "VN214",
-      "departure_local": "2025-09-17T14:00:00+07:00"
-    },
-    "return": {
-      "date_local": "2025-09-21"
-    }
-  },
-  "financial": {
-    "currency": "VND",
-    "total_vnd": 64080000,
-    "charged_account": {
-      "bank": "MB Bank",
-      "account_name": "Cty DV DL QC Binh Duong",
-      "account_no": "0879479331",
-      "masked": "0879•••9331"
-    }
-  },
-  "cause": "Ke toan duyet sai cong thong bao tru tien",
-  "status": "OPEN",
-  "source": "lebinhduong.vn/ticketing"
-}
+#!/usr/bin/env bash
+set -euo pipefail
 
--- PostgreSQL schema
-CREATE TABLE IF NOT EXISTS ticket_error_log (
-  id BIGSERIAL PRIMARY KEY,
-  logged_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-  origin_city      TEXT NOT NULL,
-  origin_iata      TEXT NOT NULL,
-  destination_city TEXT NOT NULL,
-  destination_iata TEXT NOT NULL,
-  flight_no_out    TEXT,
-  flight_no_ret    TEXT,
-  depart_at_local  TIMESTAMPTZ,
-  return_date_local DATE,
-  passengers       SMALLINT CHECK (passengers > 0),
-  is_roundtrip     BOOLEAN NOT NULL DEFAULT TRUE,
-  total_amount_vnd NUMERIC(15,0) CHECK (total_amount_vnd >= 0),
-  currency         CHAR(3) NOT NULL DEFAULT 'VND',
-  cause            TEXT,
-  bank_name        TEXT,
-  account_name     TEXT,
-  payment_account_no_raw TEXT,
-  payment_account_no_norm TEXT,
-  payment_account_masked TEXT GENERATED ALWAYS AS (
-    CASE
-      WHEN payment_account_no_norm ~ '^[0-9]{6,}$'
-      THEN substr(payment_account_no_norm,1,4) || '•••' || right(payment_account_no_norm,4)
-      ELSE NULL
-    END
-  ) STORED,
-  status           TEXT NOT NULL DEFAULT 'OPEN',
-  source           TEXT
-);
+# Config
+HEALTH_URL="${HEALTH_URL:?missing HEALTH_URL}"   # export trước trong CI
+TIMEOUT_SEC="${TIMEOUT_SEC:-3}"                  # timeout cho mỗi request
+MAX_ATTEMPTS="${MAX_ATTEMPTS:-10}"               # số lần thử
+NOTIFY_CMD="${NOTIFY_CMD:-}"                     # ví dụ: ./scripts/notify.sh
 
--- Insert bản ghi sự cố của anh
-INSERT INTO ticket_error_log (
-  origin_city, origin_iata, destination_city, destination_iata,
-  flight_no_out, flight_no_ret, depart_at_local, return_date_local,
-  passengers, is_roundtrip, total_amount_vnd, currency, cause,
-  bank_name, account_name, payment_account_no_raw, payment_account_no_norm,
-  status, source
-) VALUES (
-  'Ho Chi Minh City', 'SGN', 'Ha Noi', 'HAN',
-  'VN214', NULL, '2025-09-17 14:00:00+07', '2025-09-21',
-  8, TRUE, 64080000, 'VND', 'Ke toan duyet sai cong thong bao tru tien',
-  'MB Bank', 'Cty DV DL QC Binh Duong', 'o879479331', '0879479331',
-  'OPEN', 'lebinhduong.vn/ticketing'
+attempt=0
+until (( attempt >= MAX_ATTEMPTS )); do
+  attempt=$((attempt+1))
+  echo "Healthcheck attempt ${attempt}/${MAX_ATTEMPTS} -> ${HEALTH_URL}"
+
+  # readyz trước, fallback sang healthz nếu cần
+  if curl -fsS --max-time "$TIMEOUT_SEC" "${HEALTH_URL%/}/readyz" \
+    || curl -fsS --max-time "$TIMEOUT_SEC" "${HEALTH_URL%/}/healthz"; then
+    echo "✅ Service healthy"
+    exit 0
+  fi
+
+  # exponential backoff: 1s, 2s, 4s, 8s, ...
+  sleep_sec=$(( 2 ** (attempt-1) ))
+  echo "❌ Not healthy yet, retry in ${sleep_sec}s"
+  sleep "$sleep_sec"
+done
+
+echo "❌ Healthcheck failed after ${MAX_ATTEMPTS} attempts"
+# Gửi cảnh báo (không fail nếu notify lỗi)
+if [[ -n "$NOTIFY_CMD" ]]; then
+  set +e
+  "$NOTIFY_CMD" "Healthcheck failed for ${HEALTH_URL} after ${MAX_ATTEMPTS} attempts"
+  set -e
+fi
+exit 1
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Yêu cầu xác định version/sha trước đó
+PREV_SHA="${PREV_SHA:?missing PREV_SHA}"
+ENVIRONMENT="${ENVIRONMENT:-production}"
+
+echo "↩️  Rolling back ${ENVIRONMENT} to ${PREV_SHA}"
+# Ví dụ với Kubernetes + image tag theo SHA
+# kubectl set image deploy/my-svc my-svc=myrepo/my-svc:${PREV_SHA} --record
+# kubectl rollout status deploy/my-svc --timeout=120s
+
+echo "✅ Rollback command issued to ${PREV_SHA}"
+
+#!/usr/bin/env bash
+set -euo pipefail
+MSG="${1:-(no message)}"
+# Ví dụ gửi Slack webhook
+if [[ -n "${SLACK_WEBHOOK_URL:-}" ]]; then
+  curl -fsS -X POST -H 'Content-type: application/json' \
+    --data "{\"text\":\"${MSG}\"}" "$SLACK_WEBHOOK_URL" >/dev/null
+else
+  echo "(no SLACK_WEBHOOK_URL) ${MSG}"
+fi
+# .github/workflows/deploy.yml (trích đoạn)
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build & Deploy
+        run: ./scripts/deploy.sh
+        env:
+          IMAGE_SHA: ${{ github.sha }}
+
+      - name: Healthcheck (retry+backoff)
+        run: ./scripts/healthcheck.sh
+        env:
+          HEALTH_URL: ${{ secrets.HEALTH_URL }}
+          TIMEOUT_SEC: 3
+          MAX_ATTEMPTS: 8
+          NOTIFY_CMD: ./scripts/notify.sh
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Rollback if failed
+        if: failure()
+        run: ./scripts/rollback.sh
+        env:
+          PREV_SHA: ${{ vars.PREV_SHA }}   # cập nhật PREV_SHA trước deploy
+          ENVIRONMENT: production
+
+      - name: Notify failure
+        if: failure()
+        run: ./scripts/notify.sh "Deploy failed, rolled back to ${{ vars.PREV_SHA }}"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+WITH events AS (
+  SELECT
+    date_trunc('day', event_time) AS event_day,
+    origin, destination,
+    session_id,
+    action
+  FROM booking_logs
+  -- WHERE event_time >= now() - interval '30 days'
+),
+per_session AS (
+  -- mỗi session đếm tối đa 1 SEARCH và 1 BOOK (hoặc theo logic của bạn)
+  SELECT
+    event_day, origin, destination, session_id,
+    (COUNT(*) FILTER (WHERE action='SEARCH') > 0)::int AS has_search,
+    (COUNT(*) FILTER (WHERE action='BOOK')   > 0)::int AS has_book
+  FROM events
+  GROUP BY 1,2,3,4
 )
-RETURNING id, payment_account_masked;
-
-// npm i pg
-const { Client } = require('pg');
-
-async function logTicketError() {
-  const client = new Client({
-    connectionString: process.env.PG_URL // ví dụ: postgres://user:pass@host:5432/db
-  });
-  await client.connect();
-
-  await client.query(/*sql*/`
-    CREATE TABLE IF NOT EXISTS ticket_error_log (
-      id BIGSERIAL PRIMARY KEY,
-      logged_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      origin_city TEXT NOT NULL,
-      origin_iata TEXT NOT NULL,
-      destination_city TEXT NOT NULL,
-      destination_iata TEXT NOT NULL,
-      flight_no_out TEXT,
-      flight_no_ret TEXT,
-      depart_at_local TIMESTAMPTZ,
-      return_date_local DATE,
-      passengers SMALLINT CHECK (passengers > 0),
-      is_roundtrip BOOLEAN NOT NULL DEFAULT TRUE,
-      total_amount_vnd NUMERIC(15,0) CHECK (total_amount_vnd >= 0),
-      currency CHAR(3) NOT NULL DEFAULT 'VND',
-      cause TEXT,
-      bank_name TEXT,
-      account_name TEXT,
-      payment_account_no_raw TEXT,
-      payment_account_no_norm TEXT,
-      payment_account_masked TEXT GENERATED ALWAYS AS (
-        CASE
-          WHEN payment_account_no_norm ~ '^[0-9]{6,}$'
-          THEN substr(payment_account_no_norm,1,4) || '•••' || right(payment_account_no_norm,4)
-          ELSE NULL
-        END
-      ) STORED,
-      status TEXT NOT NULL DEFAULT 'OPEN',
-      source TEXT
-    );
-  `);
-
-  const sql = `
-    INSERT INTO ticket_error_log (
-      origin_city, origin_iata, destination_city, destination_iata,
-      flight_no_out, flight_no_ret, depart_at_local, return_date_local,
-      passengers, is_roundtrip, total_amount_vnd, currency, cause,
-      bank_name, account_name, payment_account_no_raw, payment_account_no_norm,
-      status, source
-    ) VALUES (
-      $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18
-    ) RETURNING id, payment_account_masked;
-  `;
-
-  const params = [
-    'Ho Chi Minh City', 'SGN', 'Ha Noi', 'HAN',
-    'VN214', null, '2025-09-17 14:00:00+07', '2025-09-21',
-    8, true, 64080000, 'VND', 'Ke toan duyet sai cong thong bao tru tien',
-    'MB Bank', 'Cty DV DL QC Binh Duong', 'o879479331', '0879479331',
-    'OPEN', 'lebinhduong.vn/ticketing'
-  ];
-
-  const { rows } = await client.query(sql, params);
-  console.log('Logged error id:', rows[0].id, 'Masked:', rows[0].payment_account_masked);
-  await client.end();
-}
-
-logTicketError().catch(console.error);
+SELECT
+  event_day,
+  origin, destination,
+  SUM(has_book)::float   AS books,
+  SUM(has_search)::float AS searches,
+  CASE WHEN SUM(has_search)=0 THEN NULL
+       ELSE SUM(has_book)::float / SUM(has_search)::float
+  END AS book_rate,        -- BOOK / SEARCH
+  CASE WHEN SUM(has_book)=0 THEN NULL
+       ELSE SUM(has_search)::float / SUM(has_book)::float
+  END AS ltb_ratio         -- SEARCH / BOOK (cách gọi LTB phổ biến)
+FROM per_session
+GROUP BY 1,2,3
+ORDER BY event_day DESC, origin, destination;
