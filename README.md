@@ -123,3 +123,33 @@ SELECT
 FROM per_session
 GROUP BY 1,2,3
 ORDER BY event_day DESC, origin, destination;
+from flask import Flask, jsonify, request
+import os, time
+
+app = Flask(__name__)
+START_TS = time.time()
+READY = False
+
+@app.before_first_request
+def _warmup():
+    global READY
+    time.sleep(0.5)
+    READY = True
+
+@app.get("/healthz")
+def healthz():
+    return jsonify(status="ok", uptime=time.time()-START_TS), 200
+
+@app.get("/readyz")
+def readyz():
+    if READY:
+        return jsonify(ready=True), 200
+    return jsonify(ready=False), 503
+
+@app.get("/api/v1/ping")
+def ping():
+    return jsonify(pong=True, ip=request.remote_addr)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
+
